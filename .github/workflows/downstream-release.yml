@@ -1,6 +1,9 @@
 name: Downstream release
 
 on:
+  push:
+    branches: [main]
+    paths: ['.github/release-request.txt']
   workflow_dispatch:
     inputs:
       tag:
@@ -23,8 +26,10 @@ jobs:
     if: github.repository == 'lorenz-werner/helm-push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     env:
-      TAG: ${{ inputs.tag }}
+      INPUT_TAG: ${{ inputs.tag }}
       GOFLAGS: -mod=readonly
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -34,8 +39,17 @@ jobs:
         with:
           go-version: '1.27.4'
       - name: Validate downstream tag
+        id: tag
         run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            TAG="$(cat .github/release-request.txt)"
+          else
+            TAG="$INPUT_TAG"
+          fi
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-aoksys\.[1-9][0-9]*$ ]]
+          printf 'TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
       - name: Verify Helm compatibility
         run: |
           set -euo pipefail
@@ -78,7 +92,7 @@ jobs:
     permissions:
       contents: write
     env:
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ needs.build.outputs.tag }}
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
