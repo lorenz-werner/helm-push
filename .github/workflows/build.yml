@@ -4,31 +4,44 @@ on:
   push:
     branches: main
 
+permissions:
+  contents: read
+
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      - name: setup go environment
-        uses: actions/setup-go@v2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          go-version: '1.25'
-      - name: run unit tests
-        run: sudo pip install virtualenv && make test
-      - name: build binary
-        run: make build_linux link_linux
-      - name: run acceptance tests
-        run: make acceptance
+          persist-credentials: false
+      - name: setup go environment
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: '1.27.4'
+      - name: Run unit and acceptance tests
+        env:
+          GOTOOLCHAIN: local
+          GOFLAGS: -mod=readonly
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/test-venv"
+          source "$RUNNER_TEMP/test-venv/bin/activate"
+          python -m pip install virtualenv
+          make test
+          make build_linux link_linux
+          make acceptance
       - name: upload coverage report
-        uses: actions/upload-artifact@main
+        uses: actions/upload-artifact@v4
         with:
           name: helmpush-coverage-report-${{ github.sha }}
           path: .cover/
+          include-hidden-files: true
         if: always()
       - name: upload acceptance report
-        uses: actions/upload-artifact@main
+        uses: actions/upload-artifact@v4
         with:
           name: helmpush-acceptance-report-${{ github.sha }}
           path: .robot/
+          include-hidden-files: true
         if: always()

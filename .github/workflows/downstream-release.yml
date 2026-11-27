@@ -1,0 +1,116 @@
+name: Downstream release
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/release-request.txt']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Downstream release tag, e.g. v0.11.1-aoksys.1'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: downstream-release
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  build:
+    if: github.repository == 'lorenz-werner/helm-push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    env:
+      INPUT_TAG: ${{ inputs.tag }}
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: '1.27.4'
+      - name: Validate downstream tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            TAG="$(cat .github/release-request.txt)"
+          else
+            TAG="$INPUT_TAG"
+          fi
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-aoksys\.[1-9][0-9]*$ ]]
+          printf 'TAG=%s\n' "$TAG" >> "$GITHUB_ENV"
+          printf 'tag=%s\n' "$TAG" >> "$GITHUB_OUTPUT"
+      - name: Verify Helm compatibility
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/test-venv"
+          source "$RUNNER_TEMP/test-venv/bin/activate"
+          python -m pip install virtualenv
+          make test
+          make build_linux link_linux
+          make acceptance
+      - name: Build and scan locked dependencies
+        run: bash scripts/aoksys-build-scan.sh
+      - name: Gate and package release
+        run: |
+          set -euo pipefail
+          test "$(cat downstream/security-status.txt)" = PASS
+          version="${TAG#v}"
+          for arch in amd64 arm64; do
+            for major in 3 4; do
+              stage="$(mktemp -d)"
+              mkdir -p "$stage/bin"
+              install -m 0755 "downstream/helm-cm-push-linux-$arch" "$stage/bin/helm-cm-push"
+              sed -E "s/^version: .*/version: \"$version\"/" "testdata/plugin-helm$major.yaml" > "$stage/plugin.yaml"
+              # A prebuilt archive must not download an upstream binary during installation.
+              if [[ "$major" == 3 ]]; then sed -i '/^hooks:/,$d' "$stage/plugin.yaml"; fi
+              cp LICENSE "$stage/"
+              tar -C "$stage" -czf "downstream/helm-push_${version}_helm${major}_linux_${arch}.tar.gz" .
+              rm -rf "$stage"
+            done
+          done
+          (cd downstream && sha256sum *.tar.gz >> checksums.txt)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: downstream-release-assets
+          path: downstream/
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: downstream-release-assets
+          path: downstream
+      - name: Publish tested assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GH_REPO" == lorenz-werner/helm-push ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-aoksys\.[1-9][0-9]*$ ]]
+          (cd downstream && sha256sum -c checksums.txt)
+          test "$(cat downstream/security-status.txt)" = PASS
+          test "$(cat downstream/source-commit.txt)" = "$GITHUB_SHA"
+          if gh release view "$TAG" >/dev/null 2>&1 || gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "Refusing to overwrite an existing release or tag."
+            exit 1
+          fi
+          gh release create "$TAG" downstream/* --target "$GITHUB_SHA" --title "helm-push $TAG" --notes "Unofficial downstream security build. Linux amd64/arm64 binaries and separate Helm 3/4 plugin archives, SBOMs, vulnerability reports and checksums."

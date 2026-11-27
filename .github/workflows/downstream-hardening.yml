@@ -1,0 +1,144 @@
+name: Downstream hardening
+
+on:
+  push:
+    branches: ['hardening/aoksys']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardening-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GOTOOLCHAIN: local
+  GO_VERSION: '1.27.4'
+  CGO_ENABLED: '0'
+
+jobs:
+  resolve:
+    if: github.repository == 'lorenz-werner/helm-push' && github.ref == 'refs/heads/hardening/aoksys'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Resolve patched dependencies
+        run: |
+          set -euo pipefail
+          go version
+          go get go@"$GO_VERSION"
+          # Keep Helm and its Kubernetes API family compatible; update vulnerable modules explicitly.
+          go get \
+            helm.sh/helm/v3@v3.22.1 \
+            helm.sh/helm/v4@v4.3.2 \
+            github.com/cloudflare/circl@v1.6.5 \
+            github.com/containerd/containerd@v1.7.36 \
+            github.com/klauspost/compress@v1.20.5 \
+            golang.org/x/crypto@v0.59.0 \
+            golang.org/x/net@v0.63.0 \
+            golang.org/x/sys@v0.50.0 \
+            golang.org/x/text@v0.44.0 \
+            google.golang.org/grpc@v1.85.0 \
+            oras.land/oras-go/v2@v2.7.0
+          go list -m helm.sh/helm/v3 helm.sh/helm/v4 k8s.io/apimachinery k8s.io/kube-openapi sigs.k8s.io/structured-merge-diff/v6
+          go mod tidy
+          go mod verify
+          # Reject reintroduction of the deprecated OpenPGP module.
+          go list -m all > "$RUNNER_TEMP/modules.txt"
+          if grep -E '^golang\.org/x/crypto/openpgp( |$)' "$RUNNER_TEMP/modules.txt"; then
+            echo 'Deprecated OpenPGP module remains in the graph.'
+            go mod why -m golang.org/x/crypto/openpgp
+            exit 1
+          fi
+          git diff --stat
+      - name: Test Helm 3 and Helm 4 compatibility
+        env:
+          GOFLAGS: -mod=readonly
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/test-venv"
+          source "$RUNNER_TEMP/test-venv/bin/activate"
+          python -m pip install virtualenv
+          make test
+          make build_linux link_linux
+          make acceptance
+      - name: Archive validated dependency lock files
+        uses: actions/upload-artifact@v4
+        with:
+          name: validated-go-modules
+          path: |
+            go.mod
+            go.sum
+          if-no-files-found: error
+      - name: Archive test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            .cover/
+            .robot/
+          include-hidden-files: true
+
+  commit:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: validated-go-modules
+          path: ${{ runner.temp }}/validated
+      - name: Commit only tested module files to hardening branch
+        id: commit
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == lorenz-werner/helm-push ]]
+          [[ "$GITHUB_REF" == refs/heads/hardening/aoksys ]]
+          [[ "$(git ls-remote origin "$GITHUB_REF" | cut -f1)" == "$GITHUB_SHA" ]]
+          cp "$RUNNER_TEMP/validated/go.mod" "$RUNNER_TEMP/validated/go.sum" .
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- go.mod go.sum
+          if ! git diff --cached --quiet; then
+            git commit -m "Update validated Go modules for downstream hardening"
+            git push origin HEAD:refs/heads/hardening/aoksys
+          fi
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  scan:
+    needs: commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.commit.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Build and scan candidate
+        run: bash scripts/aoksys-build-scan.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hardened-helm-push
+          path: downstream/
+          if-no-files-found: error
+      - name: Enforce vulnerability policy
+        run: test "$(cat downstream/security-status.txt)" = PASS
