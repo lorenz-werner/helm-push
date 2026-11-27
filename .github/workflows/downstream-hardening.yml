@@ -37,8 +37,8 @@ jobs:
           go get go@"$GO_VERSION"
           # Keep Helm and its Kubernetes API family compatible; update vulnerable modules explicitly.
           go get \
-            helm.sh/helm/v3@v3.20.2 \
-            helm.sh/helm/v4@v4.1.4 \
+            helm.sh/helm/v3@v3.22.1 \
+            helm.sh/helm/v4@v4.3.2 \
             github.com/cloudflare/circl@v1.6.5 \
             github.com/containerd/containerd@v1.7.36 \
             github.com/klauspost/compress@v1.20.5 \
@@ -51,6 +51,13 @@ jobs:
           go list -m helm.sh/helm/v3 helm.sh/helm/v4 k8s.io/apimachinery k8s.io/kube-openapi sigs.k8s.io/structured-merge-diff/v6
           go mod tidy
           go mod verify
+          # Reject reintroduction of the deprecated OpenPGP module.
+          go list -m all > "$RUNNER_TEMP/modules.txt"
+          if grep -E '^golang\.org/x/crypto/openpgp( |$)' "$RUNNER_TEMP/modules.txt"; then
+            echo 'Deprecated OpenPGP module remains in the graph.'
+            go mod why -m golang.org/x/crypto/openpgp
+            exit 1
+          fi
           git diff --stat
       - name: Test Helm 3 and Helm 4 compatibility
         env:
